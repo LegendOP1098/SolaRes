@@ -1,12 +1,46 @@
-checkpoints
-data
-new_dataset
-reconstructed_images
-.vscode
-_MACOSX
-bottleneck_embeddings.npy
-best_autoencoder.pth
-swinir_model.py
-samples
-checkpoints_swin_l1
-best_autoencoder.pth
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Dataset
+Solar Dataset/
+dataset/
+data/
+datasets/
+*.h5
+*.npy
+*.npz
+*.csv
+*.zip
+*.tar
+*.gz
+
+# Training outputs / checkpoints
+checkpoints/
+runs/
+outputs/
+results/
+logs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Misc
+*.log
