@@ -39,25 +39,54 @@ class SobelEdgeLoss(nn.Module):
         return F.l1_loss(self._gradients(pred), self._gradients(target))
 
 
+class FFTMagnitudeLoss(nn.Module):
+    def __init__(self, log_magnitude: bool = True) -> None:
+        super().__init__()
+        self.log_magnitude = log_magnitude
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # FFT in float32 avoids ComplexHalf operator gaps under AMP.
+        pred_fft = torch.fft.rfftn(pred.float(), dim=(-2, -1))
+        target_fft = torch.fft.rfftn(target.float(), dim=(-2, -1))
+        pred_mag = torch.abs(pred_fft)
+        target_mag = torch.abs(target_fft)
+        if self.log_magnitude:
+            pred_mag = torch.log1p(pred_mag)
+            target_mag = torch.log1p(target_mag)
+        return F.l1_loss(pred_mag, target_mag)
+
+
 class ReconstructionLoss(nn.Module):
     def __init__(
         self,
+        pixel_mode: str = "charbonnier",
         pixel_weight: float = 1.0,
         ssim_weight: float = 0.15,
         edge_weight: float = 0.1,
+        fft_weight: float = 0.0,
         ssim_data_range: float = 1.0,
         clamp_min: float | None = 0.0,
         clamp_max: float | None = 1.0,
     ) -> None:
         super().__init__()
+        self.pixel_mode = pixel_mode
         self.pixel_weight = pixel_weight
         self.ssim_weight = ssim_weight
         self.edge_weight = edge_weight
+        self.fft_weight = fft_weight
         self.ssim_data_range = ssim_data_range
         self.clamp_min = clamp_min
         self.clamp_max = clamp_max
-        self.pixel = CharbonnierLoss()
+        if pixel_mode == "charbonnier":
+            self.pixel = CharbonnierLoss()
+        elif pixel_mode == "l1":
+            self.pixel = nn.L1Loss()
+        elif pixel_mode == "mse":
+            self.pixel = nn.MSELoss()
+        else:
+            raise ValueError(f"Unsupported pixel_mode: {pixel_mode}")
         self.edge = SobelEdgeLoss()
+        self.fft = FFTMagnitudeLoss()
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
         pixel_loss = self.pixel(pred, target)
@@ -71,14 +100,17 @@ class ReconstructionLoss(nn.Module):
             target_ssim = target
         ssim_loss = 1.0 - ssim(pred_ssim, target_ssim, data_range=self.ssim_data_range, size_average=True)
         edge_loss = self.edge(pred, target)
+        fft_loss = self.fft(pred, target)
         total = (
             self.pixel_weight * pixel_loss
             + self.ssim_weight * ssim_loss
             + self.edge_weight * edge_loss
+            + self.fft_weight * fft_loss
         )
         return total, {
             "pixel": float(pixel_loss.item()),
             "ssim": float(ssim_loss.item()),
             "edge": float(edge_loss.item()),
+            "fft": float(fft_loss.item()),
             "total": float(total.item()),
         }

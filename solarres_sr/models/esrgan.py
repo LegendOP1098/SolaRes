@@ -29,15 +29,20 @@ class DenseResidualBlock(nn.Module):
 class RRDB(nn.Module):
     def __init__(self, channels: int, growth_channels: int = 32, res_scale: float = 0.2) -> None:
         super().__init__()
+        # Each DenseResidualBlock already applies res_scale internally.
+        # We use a smaller scale (res_scale^0.5) per block to achieve similar overall scaling
+        # without double-scaling the features.
+        block_scale = res_scale ** 0.5
         self.body = nn.Sequential(
-            DenseResidualBlock(channels, growth_channels, res_scale),
-            DenseResidualBlock(channels, growth_channels, res_scale),
-            DenseResidualBlock(channels, growth_channels, res_scale),
+            DenseResidualBlock(channels, growth_channels, block_scale),
+            DenseResidualBlock(channels, growth_channels, block_scale),
+            DenseResidualBlock(channels, growth_channels, block_scale),
         )
         self.res_scale = res_scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.body(x) * self.res_scale
+        # Don't apply res_scale again - blocks already scale their residuals
+        return x + self.body(x)
 
 
 class RRDBNet(nn.Module):

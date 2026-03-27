@@ -5,6 +5,7 @@ from .rcan import RCAN
 from .rlfb_esa import RLFBESANet
 from .srcnn import SRCNN
 from .srgan import PatchDiscriminator, SRGANGenerator
+from .swinir import SwinIRNet
 
 __all__ = [
     "DiffusionSR",
@@ -15,4 +16,5 @@ __all__ = [
     "RRDBNet",
     "SRCNN",
     "SRGANGenerator",
+    "SwinIRNet",
 ]

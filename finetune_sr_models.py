@@ -1,17 +1,31 @@
 from __future__ import annotations
 
 import argparse
-import json
 
-from solarres_sr import TrainConfig, fit_model, list_available_models
+from solarres_sr import TrainConfig, candidate_order, finetune_all_models, list_available_models
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train one super-resolution model on the solar dataset.")
-    parser.add_argument("--model", default="diffusion_sr", choices=list_available_models())
+    parser = argparse.ArgumentParser(
+        description="Two-stage fine-tuning across all SR models, then rank the best-fit model."
+    )
+    parser.add_argument("--models", nargs="*", default=None, choices=list_available_models())
     parser.add_argument("--dataset-root", default=None)
     parser.add_argument("--save-root", default=None)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=50, help="Final stage epochs.")
+    parser.add_argument("--quick-epochs", type=int, default=8)
+    parser.add_argument("--quick-max-train-batches", type=int, default=800)
+    parser.add_argument("--quick-max-val-batches", type=int, default=80)
+    parser.add_argument("--quick-only", action="store_true")
+    parser.add_argument("--topk-final", type=int, default=0, help="Only final-fit top K quick-search models (0 disables).")
+    parser.add_argument("--final-models", nargs="*", default=None, choices=list_available_models())
+    parser.add_argument("--skip-final-below-bicubic-margin", type=float, default=None)
+    parser.add_argument(
+        "--selection-metric",
+        default="score",
+        choices=["score", "psnr", "ssim", "bicubic_gap_psnr"],
+        help="Metric used to rank quick-search winners and optional top-k final routing.",
+    )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--discriminator-learning-rate", type=float, default=1e-4)
@@ -32,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-batches", type=int, default=200)
     parser.add_argument("--diffusion-eval-steps", type=int, default=8)
     parser.add_argument("--diffusion-metric-batches", type=int, default=2)
-    parser.add_argument("--diffusion-sampler", default="ddpm", choices=["ddpm", "deterministic_fast"])
+    parser.add_argument("--diffusion-sampler", default="ddpm", choices=["ddpm", "ddim", "deterministic_fast"])
     parser.add_argument("--disable-diffusion-eval-stabilization", action="store_true")
     parser.add_argument("--disable-diffusion-clamp-pred-x0", action="store_true")
     parser.add_argument("--disable-diffusion-self-conditioning", action="store_true")
@@ -53,15 +67,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-profile-timing", action="store_true")
     parser.add_argument("--apply-clahe", action="store_true")
     parser.add_argument("--allow-cpu-fallback", action="store_true")
-    parser.add_argument("--selection-metric", default="score", choices=["score", "psnr", "ssim", "bicubic_gap_psnr"])
+    parser.add_argument("--all-diffusion-centric", action="store_true")
     parser.add_argument("--verbose-debug", action="store_true")
+    parser.add_argument("--diffusion-final-only-if-competitive", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    models = candidate_order(diffusion_centric=True) if args.all_diffusion_centric else args.models
     config = TrainConfig(
-        model_name=args.model,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
@@ -79,6 +94,7 @@ def main() -> None:
         capacity=args.capacity,
         device=args.device,
         num_workers=args.num_workers,
+
         max_train_batches=args.max_train_batches if args.max_train_batches > 0 else None,
         max_val_batches=args.max_val_batches,
         diffusion_eval_steps=args.diffusion_eval_steps,
@@ -91,7 +107,6 @@ def main() -> None:
         diffusion_guide_weight=args.diffusion_guide_weight,
         diffusion_x0_weight=args.diffusion_x0_weight,
         diffusion_timestep_bias=args.diffusion_timestep_bias,
-
         adv_weight=args.adv_weight,
         loss_pixel_mode=args.loss_pixel_mode,
         loss_pixel_weight=args.loss_pixel_weight,
@@ -109,8 +124,29 @@ def main() -> None:
         selection_metric=args.selection_metric,
         verbose_debug=args.verbose_debug,
     )
-    summary = fit_model(config, dataset_root=args.dataset_root)
-    print(json.dumps(summary.__dict__, indent=2))
+    summaries = finetune_all_models(
+        config,
+        model_names=models,
+        dataset_root=args.dataset_root,
+        quick_epochs=args.quick_epochs,
+        quick_max_train_batches=args.quick_max_train_batches if args.quick_max_train_batches > 0 else None,
+        quick_max_val_batches=args.quick_max_val_batches if args.quick_max_val_batches > 0 else None,
+        final_epochs=args.epochs,
+        quick_only=args.quick_only,
+        topk_final=args.topk_final,
+        final_models=args.final_models,
+        skip_final_below_bicubic_margin=args.skip_final_below_bicubic_margin,
+        selection_metric=args.selection_metric,
+        diffusion_final_only_if_competitive=args.diffusion_final_only_if_competitive,
+    )
+    print("Leaderboard:")
+    for index, summary in enumerate(summaries, start=1):
+        print(
+            f"{index}. {summary.model_name} | {summary.selected_metric}={summary.selected_metric_value:.3f} | "
+            f"PSNR={summary.best_psnr:.3f} | SSIM={summary.best_ssim:.4f} | Bicubic={summary.bicubic_psnr:.3f} | "
+            f"RMSE={summary.best_rmse:.4f} | Corr={summary.best_correlation:.4f} | "
+            f"{summary.fit_diagnosis}"
+        )
 
 
 if __name__ == "__main__":

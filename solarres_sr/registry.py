@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from torch import nn
 
-from .models import DiffusionSR, EDSR, PatchDiscriminator, RCAN, RLFBESANet, RRDBNet, SRCNN, SRGANGenerator
+from .models import DiffusionSR, EDSR, PatchDiscriminator, RCAN, RLFBESANet, RRDBNet, SRCNN, SRGANGenerator, SwinIRNet
 
 
 @dataclass(frozen=True)
@@ -20,6 +20,7 @@ MODEL_SPECS: dict[str, ModelSpec] = {
     "rlfb_esa": ModelSpec("rlfb_esa", "pixel", "solar_features", "Lightweight feature-distillation model for solar SR."),
     "edsr": ModelSpec("edsr", "pixel", "grayscale", "Residual SR baseline with stronger capacity than SRCNN."),
     "rcan": ModelSpec("rcan", "pixel", "grayscale", "Channel-attention SR model with stronger detail recovery."),
+    "swinir": ModelSpec("swinir", "pixel", "grayscale", "Transformer-based SR model with shifted window attention."),
     "srgan": ModelSpec("srgan", "gan", "grayscale", "Perceptual GAN baseline."),
     "esrgan": ModelSpec("esrgan", "gan", "grayscale", "RRDB-based GAN generator for sharper reconstructions."),
     "diffusion_sr": ModelSpec("diffusion_sr", "diffusion", "grayscale", "Conditional residual diffusion model for solar SR."),
@@ -47,6 +48,11 @@ CAPACITY_PRESETS: dict[str, dict[str, dict[str, int | float | tuple[int, int]]]]
         "base": {"num_features": 64, "num_groups": 6, "num_blocks": 10, "reduction": 16},
         "large": {"num_features": 96, "num_groups": 8, "num_blocks": 12, "reduction": 16},
     },
+    "swinir": {
+        "tiny": {"embed_dim": 48, "depths": (4, 4, 4, 4), "num_heads": (4, 4, 4, 4), "window_size": 8},
+        "base": {"embed_dim": 60, "depths": (6, 6, 6, 6), "num_heads": (6, 6, 6, 6), "window_size": 8},
+        "large": {"embed_dim": 96, "depths": (6, 6, 6, 6, 6, 6), "num_heads": (6, 6, 6, 6, 6, 6), "window_size": 8},
+    },
     "srgan": {
         "tiny": {"num_features": 48, "num_blocks": 8},
         "base": {"num_features": 64, "num_blocks": 16},
@@ -71,15 +77,20 @@ def list_available_models() -> list[str]:
 
 def candidate_order(diffusion_centric: bool = True) -> list[str]:
     if diffusion_centric:
-        return ["diffusion_sr", "rcan", "edsr", "rlfb_esa", "esrgan", "srgan", "srcnn"]
-    return ["rcan", "edsr", "diffusion_sr", "rlfb_esa", "esrgan", "srgan", "srcnn"]
+        return ["diffusion_sr", "swinir", "rcan", "edsr", "rlfb_esa", "esrgan", "srgan", "srcnn"]
+    return ["swinir", "rcan", "edsr", "diffusion_sr", "rlfb_esa", "esrgan", "srgan", "srcnn"]
+
+
+def final_fit_order(model_names: list[str]) -> list[str]:
+    family_priority = {"pixel": 0, "gan": 1, "diffusion": 2}
+    return sorted(model_names, key=lambda name: (family_priority.get(MODEL_SPECS[name].family, 3), name))
 
 
 def suggest_capacity(model_name: str, train_size: int) -> str:
     if model_name not in MODEL_SPECS:
         raise KeyError(f"Unknown model: {model_name}")
 
-    if model_name in {"diffusion_sr", "rcan"}:
+    if model_name in {"diffusion_sr", "rcan", "swinir"}:
         if train_size < 2500:
             return "tiny"
         if train_size < 10000:
@@ -104,6 +115,7 @@ def build_model(
     out_channels: int = 1,
     scale: int = 4,
     capacity: str = "base",
+    diffusion_self_condition: bool = True,
 ) -> nn.Module:
     if model_name not in MODEL_SPECS:
         raise KeyError(f"Unknown model: {model_name}")
@@ -121,13 +133,21 @@ def build_model(
         return EDSR(in_channels=in_channels, out_channels=out_channels, **kwargs)
     if model_name == "rcan":
         return RCAN(in_channels=in_channels, out_channels=out_channels, **kwargs)
+    if model_name == "swinir":
+        return SwinIRNet(in_channels=in_channels, out_channels=out_channels, **kwargs)
     if model_name == "srgan":
         return SRGANGenerator(in_channels=in_channels, out_channels=out_channels, **kwargs)
     if model_name == "esrgan":
         return RRDBNet(in_channels=in_channels, out_channels=out_channels, **kwargs)
     if model_name == "diffusion_sr":
         kwargs.pop("scale", None)
-        return DiffusionSR(condition_channels=in_channels, out_channels=out_channels, **kwargs)
+        return DiffusionSR(
+            condition_channels=in_channels,
+            out_channels=out_channels,
+            scale=scale,
+            self_condition=diffusion_self_condition,
+            **kwargs,
+        )
     raise KeyError(f"Unhandled model name: {model_name}")
 
 

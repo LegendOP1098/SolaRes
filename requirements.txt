@@ -9,3 +9,4 @@ matplotlib>=3.5.0
 tqdm>=4.64.0
 scipy>=1.9.0
 pytorch_msssim
+Pillow>=9.0.0

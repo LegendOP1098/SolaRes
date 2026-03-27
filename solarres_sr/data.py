@@ -1,16 +1,38 @@
 from __future__ import annotations
 
+import hashlib
 import random
 from pathlib import Path
 from typing import Iterable
 
-import cv2
 import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+try:
+    import cv2
+except ModuleNotFoundError:  # pragma: no cover - depends on runtime environment
+    cv2 = None
+
 VALID_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+SPLIT_ALIASES: dict[str, tuple[str, ...]] = {
+    "train": ("train", "training"),
+    "training": ("training", "train"),
+    "val": ("val", "validation"),
+    "validation": ("validation", "val"),
+    "test": ("test", "testing"),
+    "testing": ("testing", "test"),
+}
+
+
+def _require_cv2(feature_name: str) -> None:
+    if cv2 is None:
+        raise ModuleNotFoundError(
+            "OpenCV is required for this path "
+            f"({feature_name}), but `cv2` is not installed. "
+            "Install it with: pip install opencv-python"
+        )
 
 
 def resolve_project_root(start: str | Path | None = None) -> Path:
@@ -41,11 +63,25 @@ def resolve_split_dirs(
     val_split: str = "validation",
 ) -> dict[str, Path]:
     root = find_dataset_root(dataset_root)
+    train_candidates = SPLIT_ALIASES.get(train_split.lower(), (train_split,))
+    val_candidates = SPLIT_ALIASES.get(val_split.lower(), (val_split,))
+
+    def _pick_split(candidates: tuple[str, ...], label: str) -> str:
+        for candidate in candidates:
+            candidate_path = root / candidate
+            if candidate_path.exists():
+                return candidate
+        # Keep original for clearer error messages below.
+        return candidates[0] if candidates else label
+
+    resolved_train_split = _pick_split(train_candidates, train_split)
+    resolved_val_split = _pick_split(val_candidates, val_split)
+
     directories = {
-        "train_lr": root / train_split / "low_res",
-        "train_hr": root / train_split / "high_res",
-        "val_lr": root / val_split / "low_res",
-        "val_hr": root / val_split / "high_res",
+        "train_lr": root / resolved_train_split / "low_res",
+        "train_hr": root / resolved_train_split / "high_res",
+        "val_lr": root / resolved_val_split / "low_res",
+        "val_hr": root / resolved_val_split / "high_res",
     }
     missing = [str(path) for path in directories.values() if not path.exists()]
     if missing:
@@ -87,15 +123,27 @@ def pair_image_files(lr_dir: str | Path, hr_dir: str | Path) -> list[tuple[Path,
     lr_by_stem = {path.stem: path for path in lr_files}
     hr_by_stem = {path.stem: path for path in hr_files}
     shared_stems = sorted(set(lr_by_stem) & set(hr_by_stem))
-    if shared_stems:
-        return [(lr_by_stem[stem], hr_by_stem[stem]) for stem in shared_stems]
-
-    if len(lr_files) != len(hr_files):
+    if not shared_stems:
         raise ValueError(
-            "LR and HR folders do not share filenames and have different image counts, "
-            "so they cannot be paired safely."
+            "No shared LR/HR filenames were found. Refusing to pair by sorted order because "
+            "that can silently corrupt supervision."
         )
-    return list(zip(lr_files, hr_files))
+
+    missing_lr = sorted(set(hr_by_stem) - set(lr_by_stem))
+    missing_hr = sorted(set(lr_by_stem) - set(hr_by_stem))
+    if missing_lr or missing_hr:
+        sample_lr = missing_lr[:5]
+        sample_hr = missing_hr[:5]
+        raise ValueError(
+            "LR/HR filename mismatch detected. "
+            f"hr_without_lr={len(missing_lr)} sample={sample_lr} "
+            f"lr_without_hr={len(missing_hr)} sample={sample_hr}"
+        )
+
+    return [(lr_by_stem[stem], hr_by_stem[stem]) for stem in shared_stems]
+
+def file_md5(path: str | Path) -> str:
+    return hashlib.md5(Path(path).read_bytes()).hexdigest()
 
 
 def load_grayscale_image(path: str | Path) -> np.ndarray:
@@ -115,6 +163,7 @@ def preprocess_solar_image(
     apply_clahe: bool = False,
     levels: int = 2,
 ) -> torch.Tensor:
+    _require_cv2("solar_features preprocessing")
     image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
     if image is None:
         raise FileNotFoundError(f"Could not read image: {img_path}")
@@ -164,6 +213,13 @@ def preprocess_solar_equalized_channel(
     img_path: str | Path,
     apply_clahe: bool = False,
 ) -> torch.Tensor:
+    if cv2 is None:
+        if apply_clahe:
+            _require_cv2("CLAHE equalization")
+        image = load_grayscale_image(img_path)
+        image_equalized = np.log1p(image) / np.log(np.float32(2.0))
+        return torch.from_numpy(np.ascontiguousarray(image_equalized, dtype=np.float32)).unsqueeze(0)
+
     image = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
     if image is None:
         raise FileNotFoundError(f"Could not read image: {img_path}")
@@ -210,7 +266,19 @@ def load_target_tensor(
     raise ValueError(f"Unsupported target_mode: {target_mode}")
 
 
-def random_augment_pair(lr_tensor: torch.Tensor, hr_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def random_augment_pair(
+    lr_tensor: torch.Tensor,
+    hr_tensor: torch.Tensor,
+    intensity_aug: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply random augmentations to LR-HR pairs consistently.
+
+    Args:
+        lr_tensor: Low-resolution tensor (C, H, W)
+        hr_tensor: High-resolution tensor (C, H, W)
+        intensity_aug: Whether to apply intensity augmentations
+    """
+    # Geometric augmentations (applied identically to both)
     if random.random() < 0.5:
         lr_tensor = torch.flip(lr_tensor, dims=[2])
         hr_tensor = torch.flip(hr_tensor, dims=[2])
@@ -221,7 +289,85 @@ def random_augment_pair(lr_tensor: torch.Tensor, hr_tensor: torch.Tensor) -> tup
     if k:
         lr_tensor = torch.rot90(lr_tensor, k=k, dims=[1, 2])
         hr_tensor = torch.rot90(hr_tensor, k=k, dims=[1, 2])
+
+    # Intensity augmentations (applied identically to both for consistency)
+    if intensity_aug:
+        # Random brightness shift (additive) - crucial for solar data with varying intensities
+        if random.random() < 0.3:
+            brightness_shift = random.uniform(-0.05, 0.05)
+            lr_tensor = lr_tensor + brightness_shift
+            hr_tensor = hr_tensor + brightness_shift
+
+        # Random contrast adjustment (multiplicative around mean)
+        if random.random() < 0.3:
+            contrast_factor = random.uniform(0.9, 1.1)
+            lr_mean = lr_tensor.mean()
+            hr_mean = hr_tensor.mean()
+            lr_tensor = (lr_tensor - lr_mean) * contrast_factor + lr_mean
+            hr_tensor = (hr_tensor - hr_mean) * contrast_factor + hr_mean
+
+        # Random intensity scaling
+        if random.random() < 0.2:
+            scale_factor = random.uniform(0.95, 1.05)
+            lr_tensor = lr_tensor * scale_factor
+            hr_tensor = hr_tensor * scale_factor
+
+        # Clamp to valid range [0, 1] after intensity augmentations
+        lr_tensor = torch.clamp(lr_tensor, 0.0, 1.0)
+        hr_tensor = torch.clamp(hr_tensor, 0.0, 1.0)
+
     return lr_tensor.contiguous(), hr_tensor.contiguous()
+
+
+
+
+def aligned_crop_pair(
+    lr_tensor: torch.Tensor,
+    hr_tensor: torch.Tensor,
+    hr_patch_size: int,
+    random_crop: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if hr_patch_size <= 0:
+        return lr_tensor, hr_tensor
+
+    _, lr_h, lr_w = lr_tensor.shape
+    _, hr_h, hr_w = hr_tensor.shape
+    if lr_h == 0 or lr_w == 0:
+        return lr_tensor, hr_tensor
+
+    scale_h = hr_h // lr_h
+    scale_w = hr_w // lr_w
+    if scale_h <= 0 or scale_w <= 0 or scale_h != scale_w:
+        return lr_tensor, hr_tensor
+    scale = scale_h
+
+    hr_patch = min(hr_patch_size, hr_h, hr_w)
+    if hr_patch == hr_h and hr_patch == hr_w:
+        return lr_tensor, hr_tensor
+    if hr_patch % scale != 0:
+        hr_patch = (hr_patch // scale) * scale
+        if hr_patch <= 0:
+            return lr_tensor, hr_tensor
+
+    lr_patch = hr_patch // scale
+    max_lr_y = lr_h - lr_patch
+    max_lr_x = lr_w - lr_patch
+    if max_lr_y < 0 or max_lr_x < 0:
+        return lr_tensor, hr_tensor
+
+    if random_crop:
+        top_lr = random.randint(0, max_lr_y) if max_lr_y > 0 else 0
+        left_lr = random.randint(0, max_lr_x) if max_lr_x > 0 else 0
+    else:
+        top_lr = max_lr_y // 2
+        left_lr = max_lr_x // 2
+
+    top_hr = top_lr * scale
+    left_hr = left_lr * scale
+
+    lr_crop = lr_tensor[:, top_lr : top_lr + lr_patch, left_lr : left_lr + lr_patch]
+    hr_crop = hr_tensor[:, top_hr : top_hr + hr_patch, left_hr : left_hr + hr_patch]
+    return lr_crop.contiguous(), hr_crop.contiguous()
 
 
 class SolarSRDataset(Dataset):
@@ -233,12 +379,16 @@ class SolarSRDataset(Dataset):
         target_mode: str = "grayscale",
         apply_clahe: bool = False,
         augment: bool = False,
+        hr_patch_size: int | None = None,
+        random_crop: bool = True,
     ) -> None:
         self.pairs = pair_image_files(lr_dir, hr_dir)
         self.input_mode = input_mode
         self.target_mode = target_mode
         self.apply_clahe = apply_clahe
         self.augment = augment
+        self.hr_patch_size = hr_patch_size
+        self.random_crop = random_crop
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -247,6 +397,13 @@ class SolarSRDataset(Dataset):
         lr_path, hr_path = self.pairs[index]
         lr_tensor = load_input_tensor(lr_path, self.input_mode, apply_clahe=self.apply_clahe)
         hr_tensor = load_target_tensor(hr_path, self.target_mode, apply_clahe=self.apply_clahe)
+        if self.hr_patch_size is not None:
+            lr_tensor, hr_tensor = aligned_crop_pair(
+                lr_tensor,
+                hr_tensor,
+                hr_patch_size=self.hr_patch_size,
+                random_crop=self.random_crop,
+            )
         if self.augment:
             lr_tensor, hr_tensor = random_augment_pair(lr_tensor, hr_tensor)
         return lr_tensor, hr_tensor
